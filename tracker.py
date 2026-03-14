@@ -207,7 +207,10 @@ class ProcessingWorker(threading.Thread):
             smooth_zoom_h  = float(h)
             zoom_target_w  = float(w)
             zoom_target_h  = float(h)
-            zoom_counter   = 0
+            zoom_counter       = 0
+            full_frame_mode    = True
+            full_frame_target  = 1.0   # 1 = full frame, 0 = tracked
+            transition_alpha   = 1.0   # current blend position
 
             writer.write(crop_frame(first_frame, smooth_box, smooth_padding,
                                     smooth_zoom_w, smooth_zoom_h, out_w, out_h))
@@ -223,13 +226,13 @@ class ProcessingWorker(threading.Thread):
                     self._put(type="roi_open")
                     new_tracker, new_box = do_reselect(current_frame, self.tracker_type)
                     self._put(type="roi_closed")
-                    if new_tracker is not None:
-                        tracker = new_tracker
-                        # Don't snap smooth_box — let EMA pan smoothly to new subject
-                        zoom_target_w  = new_box[2]
-                        zoom_target_h  = new_box[3]
-                        lost_frames    = 0
-                        zoom_counter   = 0
+                    if new_tracker is not None and new_box is not None:
+                        tracker            = new_tracker
+                        full_frame_target  = 0.0
+                        zoom_target_w   = new_box[2]
+                        zoom_target_h   = new_box[3]
+                        lost_frames     = 0
+                        zoom_counter    = 0
                         with self.config_lock:
                             smooth_padding = self.config["padding"]
                         self._put(type="reselected")
@@ -248,6 +251,8 @@ class ProcessingWorker(threading.Thread):
                         self._put(type="resumed")
                     elif key == ord('r'):
                         self.reselect_event.set()
+                    elif key == ord('f'):
+                        full_frame_target = 1.0
                     continue
 
                 ret, frame = cap.read()
@@ -263,42 +268,75 @@ class ProcessingWorker(threading.Thread):
                     alpha_zoom    = self.config["alpha_zoom"]
                     zoom_interval = self.config["zoom_interval"]
 
-                ok, bbox = tracker.update(frame)
-
-                if ok:
-                    lost_frames  = 0
-                    smooth_box   = smooth_rect(smooth_box, bbox, alpha_pos)
-                    target_pad   = padding
-                    # Sample bbox size periodically to avoid per-frame zoom jitter
-                    zoom_counter += 1
-                    zoom_sample_frames = max(1, int(zoom_interval * fps))
-                    if zoom_counter >= zoom_sample_frames:
-                        zoom_counter  = 0
-                        zoom_target_w = bbox[2]
-                        zoom_target_h = bbox[3]
+                if full_frame_mode:
+                    # Skip tracking to speed up processing; press R to reselect and resume
+                    ok         = False
+                    target_pad = padding
                 else:
-                    lost_frames += 1
-                    target_pad   = min(
-                        padding + PADDING_EXPAND_RATE * lost_frames,
-                        padding * MAX_PADDING_MULT
-                    )
+                    ok, bbox = tracker.update(frame)
+
+                    if ok:
+                        lost_frames  = 0
+                        smooth_box   = smooth_rect(smooth_box, bbox, alpha_pos)
+                        target_pad   = padding
+                        zoom_counter += 1
+                        zoom_sample_frames = max(1, int(zoom_interval * fps))
+                        if zoom_counter >= zoom_sample_frames:
+                            zoom_counter  = 0
+                            zoom_target_w = bbox[2]
+                            zoom_target_h = bbox[3]
+                    else:
+                        lost_frames += 1
+                        target_pad   = min(
+                            padding + PADDING_EXPAND_RATE * lost_frames,
+                            padding * MAX_PADDING_MULT
+                        )
 
                 # Smooth zoom size toward its target
                 smooth_zoom_w += (zoom_target_w - smooth_zoom_w) * alpha_zoom
                 smooth_zoom_h += (zoom_target_h - smooth_zoom_h) * alpha_zoom
                 smooth_padding += (target_pad - smooth_padding) * alpha_zoom
 
-                out_frame = crop_frame(frame, smooth_box, smooth_padding,
-                                       smooth_zoom_w, smooth_zoom_h, out_w, out_h)
+                # Smoothly transition transition_alpha toward full_frame_target
+                transition_alpha += (full_frame_target - transition_alpha) * 0.06
+                transition_alpha  = max(0.0, min(1.0, transition_alpha))
+                full_frame_mode   = transition_alpha > 0.999
+
+                # Build full-frame view (letterboxed)
+                fh, fw  = frame.shape[:2]
+                scale   = min(out_w / fw, out_h / fh)
+                nw, nh  = int(fw * scale), int(fh * scale)
+                canvas  = np.zeros((out_h, out_w, 3), dtype=np.uint8)
+                canvas[(out_h - nh) // 2:(out_h - nh) // 2 + nh,
+                       (out_w - nw) // 2:(out_w - nw) // 2 + nw] = cv2.resize(frame, (nw, nh))
+
+                # Build tracked crop view
+                tracked_frame = crop_frame(frame, smooth_box, smooth_padding,
+                                           smooth_zoom_w, smooth_zoom_h, out_w, out_h)
+
+                # Blend between the two based on transition_alpha
+                if transition_alpha <= 0.001:
+                    out_frame = tracked_frame
+                elif transition_alpha >= 0.999:
+                    out_frame = canvas
+                else:
+                    out_frame = cv2.addWeighted(tracked_frame, 1.0 - transition_alpha,
+                                                canvas, transition_alpha, 0)
                 writer.write(out_frame)
 
                 # Preview overlay (not written to file)
                 preview = out_frame.copy()
-                label   = f"TRACKING  {frame_idx}/{total}" if ok else f"LOST ({lost_frames})  {frame_idx}/{total}"
-                color   = (0, 220, 0) if ok else (0, 0, 220)
+                if full_frame_mode:
+                    label, color = f"FULL FRAME  {frame_idx}/{total}", (200, 200, 0)
+                elif ok:
+                    label, color = f"TRACKING  {frame_idx}/{total}", (0, 220, 0)
+                else:
+                    label, color = f"LOST ({lost_frames})  {frame_idx}/{total}", (0, 0, 220)
                 cv2.putText(preview, label, (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-                cv2.putText(preview, "R=reselect  SPACE=pause  Q=quit", (10, out_h - 12),
+                hint = ("R=reselect to resume  SPACE=pause  Q=quit" if full_frame_target >= 1.0
+                        else "F=full frame  R=reselect  SPACE=pause  Q=quit")
+                cv2.putText(preview, hint, (10, out_h - 12),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
                 cv2.imshow("Tracking Preview", preview)
 
@@ -320,6 +358,8 @@ class ProcessingWorker(threading.Thread):
                     self._put(type="paused")
                 elif key == ord('r'):
                     self.reselect_event.set()
+                elif key == ord('f'):
+                    full_frame_mode = not full_frame_mode
 
         except Exception as e:
             self._put(type="error", message=str(e))
